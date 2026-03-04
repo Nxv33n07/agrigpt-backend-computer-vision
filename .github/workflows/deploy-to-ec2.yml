@@ -1,0 +1,288 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]  # Triggers when PR is merged into main
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deploy even if health check fails'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  deployments: write
+
+env:
+  EC2_HOST: ${{ secrets.EC2_HOST }}
+  EC2_USER: ${{ secrets.EC2_USER }}
+  SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+  APP_DIR: ${{ secrets.EC2_APP_DIR }}
+  SERVICE_NAME: ${{ secrets.EC2_SERVICE_NAME }}
+  HEALTH_CHECK_URL: ${{ secrets.HEALTH_CHECK_URL }}
+  REPO_URL: ${{ secrets.REPO_CLONE_URL }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create GitHub Deployment
+        id: deployment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DEPLOY=$(curl -s -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/deployments" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "ref": "main",
+              "environment": "production",
+              "auto_merge": false,
+              "required_contexts": [],
+              "description": "Auto deploy from merged PR to main"
+            }')
+          DEPLOY_ID=$(echo "$DEPLOY" | jq -r '.id')
+          echo "deploy_id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts 2>/dev/null
+          ssh -i ~/.ssh/deploy_key -o ConnectTimeout=10 -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST "echo '✅ SSH connection OK'"
+
+      - name: Pre-deploy health check
+        id: pre_health
+        continue-on-error: true
+        run: |
+          STATUS=$(ssh -i ~/.ssh/deploy_key $EC2_USER@$EC2_HOST \
+            "curl -sf -o /dev/null -w '%{http_code}' $HEALTH_CHECK_URL 2>/dev/null || echo '000'")
+          echo "pre_deploy_status=$STATUS" >> $GITHUB_OUTPUT
+          echo "📊 Pre-deploy server status: $STATUS"
+
+      - name: Backup current version
+        run: |
+          echo "📦 Creating backup..."
+          ssh -i ~/.ssh/deploy_key $EC2_USER@$EC2_HOST << 'BACKUP_SCRIPT'
+            set -e
+            APP_DIR="${{ env.APP_DIR }}"
+            cd "$APP_DIR" 2>/dev/null || { echo "App dir not found, fresh deploy"; exit 0; }
+
+            CURRENT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "none")
+            echo "$CURRENT_COMMIT" > /tmp/previous_commit_cv.txt
+            echo "📌 Current commit: $CURRENT_COMMIT"
+
+            if [ -f .env ]; then
+              cp .env /tmp/.env.backup.cv
+              echo "✅ .env backed up"
+            fi
+          BACKUP_SCRIPT
+
+      - name: Deploy latest changes
+        id: deploy_step
+        run: |
+          echo "🚀 Deploying computer-vision backend to EC2..."
+          ssh -i ~/.ssh/deploy_key $EC2_USER@$EC2_HOST << 'DEPLOY_SCRIPT'
+            set -e
+
+            APP_DIR="${{ env.APP_DIR }}"
+            SERVICE="${{ env.SERVICE_NAME }}"
+            REPO_URL="${{ env.REPO_URL }}"
+
+            echo "========================================="
+            echo "🚀 CV BACKEND DEPLOYMENT STARTED"
+            echo "========================================="
+
+            # ----- Pull latest code from prod -----
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "📥 First deployment - cloning repo..."
+              git clone -b main "$REPO_URL" "$APP_DIR"
+              cd "$APP_DIR"
+            else
+              echo "📥 Pulling latest main changes..."
+              cd "$APP_DIR"
+              git fetch origin main
+              git checkout main 2>/dev/null || git checkout -b main origin/main
+              git reset --hard origin/main
+              git clean -fd
+            fi
+
+            NEW_COMMIT=$(git rev-parse HEAD)
+            echo "📌 Deployed commit: $NEW_COMMIT"
+            echo "📝 Message: $(git log -1 --pretty=%B)"
+
+            # ----- Restore .env -----
+            if [ -f /tmp/.env.backup.cv ]; then
+              cp /tmp/.env.backup.cv .env
+              echo "✅ .env restored"
+            fi
+
+            # ----- Ensure S3 env vars exist -----
+            for VAR in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_S3_BUCKET_NAME AWS_REGION; do
+              if ! grep -q "^$VAR=" .env 2>/dev/null; then
+                echo "⚠️ Missing $VAR in .env — add it manually on EC2"
+              fi
+            done
+
+            # ----- Install Python dependencies -----
+            echo "🐍 Installing dependencies..."
+            if [ -d "venv" ]; then
+              source venv/bin/activate
+            elif [ -d ".venv" ]; then
+              source .venv/bin/activate
+            else
+              echo "⚠️ No virtualenv found, using system Python"
+            fi
+
+            if [ -f "requirements.txt" ]; then
+              pip install -r requirements.txt --quiet 2>&1 | tail -5
+              echo "✅ Dependencies installed"
+            fi
+
+            # ----- Run migrations if applicable -----
+            if [ -f "alembic.ini" ]; then
+              echo "🗄️ Running Alembic migrations..."
+              alembic upgrade head 2>&1 | tail -5
+            fi
+
+            # ----- Restart with pm2 -----
+            echo "🔄 Restarting service via pm2..."
+            if pm2 list | grep -q "$SERVICE"; then
+              pm2 restart "$SERVICE" --update-env
+              echo "✅ pm2 restarted: $SERVICE"
+            else
+              echo "⚠️ Service '$SERVICE' not found in pm2."
+              pm2 list
+              if [ -f "ecosystem.config.js" ]; then
+                pm2 start ecosystem.config.js
+                echo "✅ Started via ecosystem.config.js"
+              elif [ -f "ecosystem.config.cjs" ]; then
+                pm2 start ecosystem.config.cjs
+                echo "✅ Started via ecosystem.config.cjs"
+              else
+                echo "❌ No pm2 config found and service not running"
+                exit 1
+              fi
+            fi
+
+            pm2 save
+            sleep 5
+            pm2 show "$SERVICE" 2>/dev/null | head -20
+
+            echo "========================================="
+            echo "✅ CV BACKEND DEPLOYMENT COMPLETED"
+            echo "========================================="
+          DEPLOY_SCRIPT
+
+      - name: Post-deploy health check
+        id: health_check
+        run: |
+          echo "🏥 Running health check..."
+          MAX_RETRIES=15
+          RETRY=0
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            STATUS=$(ssh -i ~/.ssh/deploy_key $EC2_USER@$EC2_HOST \
+              "curl -sf -o /dev/null -w '%{http_code}' $HEALTH_CHECK_URL 2>/dev/null || echo '000'")
+
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Health check PASSED! Server responding 200"
+              echo "healthy=true" >> $GITHUB_OUTPUT
+              break
+            fi
+
+            echo "⏳ Attempt $((RETRY+1))/$MAX_RETRIES - Status: $STATUS"
+            RETRY=$((RETRY+1))
+            sleep 5
+          done
+
+          if [ $RETRY -eq $MAX_RETRIES ]; then
+            echo "❌ Health check FAILED"
+            echo "healthy=false" >> $GITHUB_OUTPUT
+            echo "📋 pm2 logs (last 30 lines):"
+            ssh -i ~/.ssh/deploy_key $EC2_USER@$EC2_HOST \
+              "pm2 logs ${{ env.SERVICE_NAME }} --lines 30 --nostream" 2>/dev/null || true
+          fi
+
+      - name: Rollback on failure
+        if: steps.health_check.outputs.healthy == 'false' && github.event.inputs.force_deploy != 'true'
+        run: |
+          echo "🔙 ROLLING BACK..."
+          ssh -i ~/.ssh/deploy_key $EC2_USER@$EC2_HOST << 'ROLLBACK_SCRIPT'
+            set -e
+            APP_DIR="${{ env.APP_DIR }}"
+            SERVICE="${{ env.SERVICE_NAME }}"
+            cd "$APP_DIR"
+
+            PREV_COMMIT=$(cat /tmp/previous_commit_cv.txt 2>/dev/null || echo "")
+            if [ -n "$PREV_COMMIT" ] && [ "$PREV_COMMIT" != "none" ]; then
+              echo "🔙 Rolling back to: $PREV_COMMIT"
+              git reset --hard "$PREV_COMMIT"
+
+              if [ -f /tmp/.env.backup.cv ]; then
+                cp /tmp/.env.backup.cv .env
+              fi
+
+              if [ -d "venv" ]; then
+                source venv/bin/activate
+              elif [ -d ".venv" ]; then
+                source .venv/bin/activate
+              fi
+              pip install -r requirements.txt --quiet 2>/dev/null
+
+              pm2 restart "$SERVICE" --update-env
+              pm2 save
+              echo "✅ Rollback completed"
+            else
+              echo "⚠️ No previous commit found for rollback"
+            fi
+          ROLLBACK_SCRIPT
+          echo "❌ Deployment failed - rolled back!" && exit 1
+
+      - name: Update deployment status
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_ID: ${{ steps.deployment.outputs.deploy_id }}
+        run: |
+          if [ "${{ steps.health_check.outputs.healthy }}" = "true" ]; then
+            STATE="success"
+            DESC="✅ CV backend deployed to EC2"
+          else
+            STATE="failure"
+            DESC="❌ Deploy failed - rolled back"
+          fi
+
+          curl -s -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/deployments/$DEPLOY_ID/statuses" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"state\": \"$STATE\",
+              \"description\": \"$DESC\",
+              \"environment\": \"production\"
+            }"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## 📋 CV Backend Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| SSH Connection | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pre-deploy Status | ${{ steps.pre_health.outputs.pre_deploy_status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Code Pull | ${{ steps.deploy_step.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health Check | ${{ steps.health_check.outputs.healthy }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
