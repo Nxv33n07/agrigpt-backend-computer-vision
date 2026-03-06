@@ -251,3 +251,5 @@ curl -X POST http://localhost:8000/image-query/query \
 ## License
 
 MIT
+# agrigpt-backend-computer-vision
+# pipeline test

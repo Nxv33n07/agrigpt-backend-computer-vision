@@ -1,0 +1,67 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          git fetch origin main
+          DIFF=$(git diff origin/main...HEAD)
+          echo "$DIFF" > /tmp/pr_diff.txt
+          echo "has_diff=true" >> $GITHUB_OUTPUT
+
+      - name: Get changed files
+        run: |
+          git fetch origin main
+          git diff --name-only origin/main...HEAD > /tmp/changed_files.txt
+
+      - name: Claude AI Review
+        if: steps.diff.outputs.has_diff == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          DIFF=$(cat /tmp/pr_diff.txt | head -c 50000)
+          FILES=$(cat /tmp/changed_files.txt)
+
+          REVIEW=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$(jq -n \
+              --arg diff "$DIFF" \
+              --arg files "$FILES" \
+              '{
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 4000,
+                messages: [{
+                  role: "user",
+                  content: ("You are a senior code reviewer for a computer vision / AI backend (Python, FastAPI). Review this PR from dev to main carefully.\n\nChanged files:\n" + $files + "\n\nDiff:\n" + $diff + "\n\nProvide:\n1. **Summary** - What this PR does\n2. **Issues** - Bugs, security issues, performance problems (be specific with file + line)\n3. **CV/ML Concerns** - Model loading issues, memory leaks, GPU handling, inference bottlenecks\n4. **Suggestions** - Improvements\n5. **Verdict** - APPROVE / REQUEST_CHANGES / COMMENT\n\nBe concise but thorough. Focus on real production issues.")
+                }]
+              }')" | jq -r '.content[0].text')
+
+          # Post review as PR comment
+          curl -s -X POST \
+            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/reviews" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "## 🤖 Claude AI Review (dev → main)\n\n$REVIEW" \
+              '{body: $body, event: "COMMENT"}')"
